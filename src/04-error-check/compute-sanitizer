@@ -1,0 +1,9 @@
+#CUDA Memory Checker integration removed
+#cuda-memcheck has been deprecated in CUDA 11.x and replaced by Compute Sanitizer. 
+#The new memory checking workflow is to use Compute Sanitizer from the CLI. 
+#This will support coredumps when issues are detected which can then be opened and inspected with CUDA-GDB, similar to other coredumps. 
+#Support for cuda-memcheck has been removed with the CUDA 12.0 release.
+
+
+nvcc memcheck.cu -o memcheck
+compute-sanitizer --tool memcheck ./memcheck
