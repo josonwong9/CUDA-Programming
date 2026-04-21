@@ -1,0 +1,4 @@
+in cuda version cuda_12.8.r12.8/compiler.35583870_0
+compile add1cpu.cu with: nvcc -O3 -arch=sm_75 add1cpu.cu:
+The nvcc fatal error regarding the --arch=sm_75 option is because your add1cpu.cu file does not contain any CUDA code that needs to be compiled for a GPU. 
+The add function in that file runs on the CPU. Therefore, the --arch flag is not relevant and should be removed from the compilation command.
