@@ -81,8 +81,14 @@ void timing(const real *d_A, real *d_B, const int N, const int task)
     /*block_size = (32, 32)的优点：
         1，32和warp大小一致；
            CUDA 一个 warp 通常是 32 个线程。如果线程布局是 threadIdx.x 为快变维度，那么一行正好 32 个线程，常常对应一个 warp；
-           这意味着：同一 warp 的线程正好可以访问一整行的 32 个元素，是否“连续访问”会非常清楚；
+           这意味着：同一 warp 的线程正好可以访问一整行的 32 个元素，
+                    是否“连续访问”会非常清楚；
         2，方便观察 coalescing；
+           例如：
+            * A[ny * N + nx]：同一 warp 的 nx 连续，所以访问连续
+            * A[nx * N + ny]：同一 warp 的 nx 连续，但地址按列跳跃，所以不连续
+
+            这个实验设计非常典型，就是为了直观展示 coalesced vs non-coalesced。
     */
     const dim3 block_size(TILE_DIM, TILE_DIM); //block_size = (32, 32)，所以每个 block 覆盖矩阵中的一个 32x32 区域
     const dim3 grid_size(grid_size_x, grid_size_y); // grid 大小
@@ -142,27 +148,70 @@ void timing(const real *d_A, real *d_B, const int N, const int task)
     printf("Time = %g +- %g ms.\n", t_ave, t_err);
 }
 
-__global__ void copy(const real *A, real *B, const int N)
+/*
+对于一个 warp 来说，通常 threadIdx.x 连续变化，所以：
+* 读取 A[index]：地址连续
+* 写入 B[index]：地址连续
+这就是典型的 coalesced read + coalesced write
+也就是 合并读 + 合并写
+这是最理想的全局内存访问模式之一，因此通常最快。
+*/
+__global__ void copy(const real *A, real *B, const int N)/*线程映射关系：每个线程处理矩阵中一个元素 (ny, nx)。*/
 {
     const int nx = blockIdx.x * TILE_DIM + threadIdx.x;
     const int ny = blockIdx.y * TILE_DIM + threadIdx.y;
     const int index = ny * N + nx; //矩阵元素线性下标公式A[ny * N + nx] 表示第 ny 行第 nx 列
     if (nx < N && ny < N)
     {
-        B[index] = A[index];
+        B[index] = A[index];/*也就是直接拷贝：B(y, x) = A(y, x)*/
     }
 }
 
+/*
+A[ny * N + nx] 对于同一行中 nx 连续的线程，访问地址连续。
+所以 读是合并的（coalesced read）
+B[nx * N + ny]
+这里对于 warp 中相邻线程，nx 在变，而 ny 通常固定，因此地址差是 N 个元素，而不是 1 个元素。
+也就是线程写的是跨行跳跃位置。
+所以 写是不合并的（non-coalesced write）
+GPU 全局内存最喜欢的是“相邻线程访问相邻地址”。
+这里写入变成了“相邻线程访问跨度很大的地址”，会导致：
+* 内存事务数量增多
+* 带宽利用率下降
+* 性能明显差于 copy
+
+*/
 __global__ void transpose1(const real *A, real *B, const int N)
 {
     const int nx = blockIdx.x * blockDim.x + threadIdx.x;
     const int ny = blockIdx.y * blockDim.y + threadIdx.y;
     if (nx < N && ny < N)
     {
-        B[nx * N + ny] = A[ny * N + nx]; //矩阵元素线性下标公式A[ny * N + nx] 表示第 ny 行第 nx 列
+        B[nx * N + ny] = A[ny * N + nx]; //矩阵元素线性下标公式A[ny * N + nx] 表示第 ny 行第 nx 列 / B(x, y) = A(y, x) 这就是标准矩阵转置。
     }
 }
 
+/*
+B(y, x) = A(x, y)
+这个结果和真正的转置矩阵内容是一样的。
+因为标准转置也是：
+B = A^T, B(y,x)=A(x,y)
+所以 transpose2 也是在做转置，只是从“输出坐标”的角度写法不同。
+* transpose1：从 A 的正常布局顺序读，往 B 的转置位置写
+* transpose2：从 A 的转置位置读，往 B 的正常布局顺序写
+相邻线程写相邻地址
+所以 写是合并的（coalesced write）
+相邻线程读的地址相隔 N
+所以 读是不合并的（non-coalesced read）
+和 transpose1 谁更快
+这个取决于 GPU 架构、cache、内存系统等。
+很多情况下：
+
+* 不合并读和不合并写都会慢
+* 但有时“不合并读 + 合并写”会比“合并读 + 不合并写”稍好
+* 也有可能差不多
+这个程序就是在实验这种差异。
+*/
 __global__ void transpose2(const real *A, real *B, const int N)
 {
     const int nx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -173,6 +222,31 @@ __global__ void transpose2(const real *A, real *B, const int N)
     }
 }
 
+/*
+它和 transpose2 完全一样，只是把读取方式从普通加载改成了：
+__ldg(&A[...])
+
+__ldg() 是 CUDA 提供的只读加载指令接口。
+它提示编译器/硬件：
+
+* 这个地址的数据只读
+* 可以走只读数据缓存路径
+
+通常适用于：
+* 输入数组不会被修改
+* 存在重复读取
+* 普通全局内存访问效率不高
+在这里为什么可能有帮助
+因为 transpose2/3 的问题在于 读不连续。
+如果这些不连续读能更好地利用只读缓存，那么 transpose3 可能比 transpose2 快一点。
+但要注意：
+
+* 在较新的 GPU 架构上，编译器有时会自动做优化
+* __ldg() 的收益可能不明显
+* 甚至和普通读几乎一样
+
+所以它的实验意义大于“必然更快”。
+*/
 __global__ void transpose3(const real *A, real *B, const int N)
 {
     const int nx = blockIdx.x * blockDim.x + threadIdx.x;
